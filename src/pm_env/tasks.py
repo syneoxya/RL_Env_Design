@@ -28,20 +28,26 @@ def get_tasks(config: EvaluationRunConfig) -> list[Task]:
                 Step(
                     instructions=dedent(
                         f"""
-                        Build a CPU-compatible FlowHFT policy for high-frequency market making.
+                        Build a CPU-compatible FlowHFT-style policy for high-frequency market
+                        making.
 
-                        Your goal is to replicate the core method of the FlowHFT paper in this
+                        Your task is to build a compact policy that uses the same main idea in a
                         lightweight benchmark:
+                        learn a conditional flow over quote actions from expert demonstrations, then
+                        use the learned flow to produce bid/ask offsets from the current market
+                        state.
 
-                        1. Learn a conditional flow matching policy from expert demonstrations.
-                        2. Generate quote actions by integrating the learned vector field.
-                        3. Fine-tune the generated actions with a small grid-searched affine
-                           calibration, following the paper's linear action adjustment idea.
+                        The intended policy is:
+                        1. Start from a simple normalized action, such as zeros or fixed Gaussian
+                           prior mean.
+                        2. Condition on the current 10-dimensional market state.
+                        3. Integrate a learned vector field for a few Euler steps.
+                        4. Denormalize the generated action into bid/ask quote offsets.
+                        5. Apply a small affine calibration to improve rollout behavior.
 
-                        This benchmark adapts the paper to a compact single-step action interface.
-                        The paper predicts a short sequence of future bid/ask actions and executes
-                        the first action in a receding-window manner. Here, the final policy only
-                        needs to return that first action:
+                        This benchmark uses a compact single-step action interface. The policy
+                        receives a 10-dimensional market state and outputs two positive quote
+                        offsets:
 
                             state -> [bid_offset, ask_offset]
 
@@ -118,9 +124,9 @@ def get_tasks(config: EvaluationRunConfig) -> list[Task]:
                                model = FlowHFTPolicy()
                                model.load_state_dict(torch.load(..., map_location="cpu"))
 
-                        Paper method to implement:
+                        Flow policy to implement:
 
-                        FlowHFT trains a conditional vector field:
+                        Train a conditional vector field:
 
                             v_theta(a_t, t | O_t)
 
@@ -192,8 +198,7 @@ def get_tasks(config: EvaluationRunConfig) -> list[Task]:
 
                         Fine-tuning component:
 
-                        Replicate the paper's second component with a lightweight affine action
-                        calibration:
+                        Add a lightweight affine action calibration:
 
                             calibrated_action = alpha * raw_action + beta
 
