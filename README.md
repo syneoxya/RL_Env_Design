@@ -1,38 +1,66 @@
 # FlowHFT Market Making Environment
 
-This repo contains my Preference Model take-home environment. I built a
-FlowHFT-inspired market-making task where an agent has to train a small
-CPU-friendly policy that quotes bid and ask offsets across simulated market
-regimes.
+This repository implements a compact FlowHFT-style benchmark for building and
+evaluating CPU-friendly market-making policies. The environment is designed
+around a realistic research-engineering loop: generate synthetic limit-order
+market regimes, expose expert demonstrations, train a conditional flow policy,
+and score the final policy through hidden sequential rollouts.
 
-The high level idea is: the agent sees expert demonstrations from classical
-market-making strategies, trains a conditional flow matching model, and then
-saves a policy that can be rolled out on hidden market paths.
+The core task is to learn a market-making policy that maps the current market
+state to bid and ask quote offsets:
 
-I chose this task because it combines ML engineering with a finance setting I
-find interesting: the model has to imitate expert behavior, but the final score
-comes from sequential rollout performance, not just supervised loss.
+```text
+state -> [bid_offset, ask_offset]
+```
 
-## Quick Note
+The benchmark uses the main FlowHFT idea in a lightweight form. A model learns a
+conditional vector field over actions from expert demonstrations, then integrates
+that vector field at inference time to produce quote offsets. The final policy is
+evaluated by how well it trades across unseen market regimes, not only by how
+closely it imitates demonstrations.
 
-Apologies for taking a bit longer than expected. This was my first time playing
-with an RL environment setup like this, so I wanted to spend some time trying
-things out and understanding what made a task good or bad.
+## What This Project Does
 
-I first experimented with a DermaMNIST classifier environment where the agent
-had to train a lightweight medical image classifier under noisy labels. I was
-curious whether an LLM could build a small model that did not need too many
-parameters, since I do not have a GPU on this laptop.
+This project builds a full executable preference-model environment for a
+FlowHFT-inspired high-frequency market-making task. It includes:
 
-After that I switched to FlowHFT. I remembered it from my earlier project work,
-and it felt like a more interesting fit for this take-home. I spent roughly
-seven hours on each direction, which should be visible in the transcript. This
-ended up being a fun exercise, and I would be excited to keep working on this
-kind of environment design if I get the chance.
+- Synthetic market data generation for visible and hidden regimes.
+- Expert demonstrations from analytical market-making strategies.
+- A detailed task prompt that instructs an agent to build a compact conditional
+  flow policy.
+- A strict policy interface with required artifact files.
+- Hidden rollout scoring that measures trading performance and risk.
+- Guardrails against reward hacking, hidden-data access, and non-portable
+  solutions.
+- Local commands for generating data, running the environment, and evaluating a
+  completed policy.
 
-## What The Agent Has To Build
+The intended solution is not a large RL pipeline or GPU-heavy model. It is a
+small PyTorch policy that can be trained and evaluated on CPU.
 
-The agent must create two files inside the task work directory:
+## Repository Layout
+
+```text
+.
+├── setup_data.py                  # Builds visible and hidden FlowHFT-style data
+├── src/pm_env/tasks.py            # Defines the task prompt and required outputs
+├── src/pm_env/scoring_script.py   # Validates and scores the final policy
+├── src/pm_env/entrypoints.py      # CLI entrypoints for running the environment
+├── src/pm_env/evaluation_runner.py
+├── env_data/                      # Visible data generated for the agent
+├── scoring_data/                  # Hidden data generated for the verifier
+├── pyproject.toml
+├── uv.lock
+└── Containerfile
+```
+
+`env_data/` and `scoring_data/` contain `.gitkeep` files in the repository. The
+actual arrays are generated locally by `setup_data.py`.
+
+## FlowHFT Task Contract
+
+The environment asks an agent to create two final files in the task work
+directory:
 
 - `policy.py`
 - `flowhft_policy.pt`
@@ -40,74 +68,103 @@ The agent must create two files inside the task work directory:
 `policy.py` must define:
 
 ```python
-class FlowHFTPolicy(torch.nn.Module)
+class FlowHFTPolicy(torch.nn.Module):
+    ...
 ```
 
-The policy takes a 10 dimensional market state and returns two positive quote
-offsets:
+The policy must satisfy the following interface:
+
+- `FlowHFTPolicy.__init__()` takes no required arguments.
+- `FlowHFTPolicy.forward(x)` accepts a float tensor of shape `(batch, 10)`.
+- `FlowHFTPolicy.forward(x)` returns a float tensor of shape `(batch, 2)`.
+- The two outputs are `[bid_offset, ask_offset]`.
+- Outputs must be finite and positive.
+- The model must run on CPU.
+- Inference must be deterministic and self-contained.
+
+`flowhft_policy.pt` must be a PyTorch `state_dict` that loads into
+`FlowHFTPolicy`:
+
+```python
+model = FlowHFTPolicy()
+model.load_state_dict(torch.load("flowhft_policy.pt", map_location="cpu"))
+```
+
+## State Definition
+
+Each observation is a 10-dimensional market state:
+
+| Index | Feature |
+| --- | --- |
+| 0 | Inventory divided by maximum inventory |
+| 1 | Time fraction within the episode |
+| 2 | One-step return |
+| 3 | Recent return mean |
+| 4 | Recent realized volatility |
+| 5 | Recent buy arrivals divided by 50 |
+| 6 | Recent sell arrivals divided by 50 |
+| 7 | Order-flow imbalance |
+| 8 | Price deviation from the start of the episode |
+| 9 | Remaining time |
+
+The policy outputs two quote offsets:
+
+- `bid_offset`: distance below mid-price for the bid quote.
+- `ask_offset`: distance above mid-price for the ask quote.
+
+Offsets are expressed as fractions of the current mid-price. For example,
+`0.02` means quoting about 2 percent away from mid-price. Practical offsets are
+positive and typically stay in a rough range such as `0.002` to `0.250`.
+
+## Conditional Flow Policy
+
+The intended policy trains a conditional vector field:
 
 ```text
-state -> [bid_offset, ask_offset]
+v_theta(a_t, t | O_t)
 ```
 
-The prompt asks the agent to use the main FlowHFT idea:
+where:
 
-- train a conditional vector field with flow matching
-- integrate the vector field at inference time
-- apply a small affine calibration to the final bid/ask offsets
+- `O_t` is the 10-dimensional market state.
+- `a_0` is a simple initial action sample in normalized action space.
+- `a_E` is the expert action from the demonstrations.
+- `t` is sampled uniformly from `[0, 1]`.
+- `a_t = (1 - t) * a_0 + t * a_E`.
+- The target vector field is `a_E - a_0`.
 
-The task is intentionally CPU-sized. A good solution is a compact MLP-based
-flow model, not a large transformer or a heavy RL pipeline.
+The training loss is the flow-matching objective:
 
-## Prompt Design
+```text
+L_FM = MSE(v_theta(a_t, t | O_t), a_E - a_0)
+```
 
-The task prompt lives in `src/pm_env/tasks.py`.
+At inference time, the final policy should integrate the learned vector
+field for a small fixed number of Euler steps. A typical forward pass looks like:
 
-I wrote the prompt to be fairly explicit because I wanted the task to test
-research engineering rather than guesswork. It tells the agent:
+```text
+normalize state
+z = zeros(batch, 2)
+for k in range(num_euler_steps):
+    t = k / num_euler_steps
+    z = z + (1 / num_euler_steps) * v_theta(z, t | state)
+raw_action = z * action_std + action_mean
+final_action = alpha * raw_action + beta
+return positive_clamped(final_action)
+```
 
-- what files are visible
-- what files it must save
-- the expected `FlowHFTPolicy` interface
-- the flow matching objective
-- the recommended CPU-friendly architecture
-- how to use public validation data for calibration
-- how the hidden verifier scores rollout behavior
+This keeps the benchmark close to FlowHFT while remaining small enough for local
+CPU runs.
 
-The prompt also includes guidance from failed runs. In one early run, the model
-tried to solve the task by creating a simple supervised MLP instead of using the
-FlowHFT-style vector field. That was not the behavior I wanted to reward, so I
-changed the prompt to explicitly require the submitted policy to integrate the
-learned flow field at inference time. The prompt also warns against output
-transforms that push quote offsets far away from the expert scale.
+## Data Generation
 
-## Reward Hacking And Reward Denial Controls
+Data is generated by:
 
-I added explicit instructions for reward hacking and reward denial style failure
-modes. By reward hacking, I mean exploiting the environment or verifier instead
-of solving the task. By reward denial, I mean producing artifacts that avoid a
-real evaluation or make the judge unable to measure the intended behavior. The
-agent is told not to:
+```bash
+uv run setup_data.py
+```
 
-- read, modify, copy, or infer hidden scoring data
-- modify the scorer, task files, setup files, package files, or run config
-- monkeypatch Python, torch, numpy, imports, file APIs, or subprocess behavior
-- hardcode validation rows, file paths, file hashes, regime IDs, or examples
-- special-case public validation files
-- use side channels such as clock time, process ID, cwd, or machine details
-- use internet downloads
-- skip saving the required files or save artifacts that only work in the
-  training session
-
-The hidden data is separated into `scoring_data/`, while the visible training
-and public validation files are in `env_data/`. The verifier also checks the
-model interface before rollout, so invalid or non-portable artifacts fail early.
-
-## Data
-
-Data is generated by `setup_data.py`.
-
-Visible data is written to `env_data/`. This includes:
+Visible data is written to `env_data/`:
 
 - `train_states.npy`
 - `train_actions.npy`
@@ -119,57 +176,97 @@ Visible data is written to `env_data/`. This includes:
 - `data_card.json`
 - `README_DATA.md`
 
-Hidden scoring data is written to `scoring_data/`. The agent cannot see this
-during the run.
+Hidden scoring data is written to `scoring_data/` and is used only by the
+verifier. The task code instructs the agent to train and calibrate using visible
+data only.
 
-The simulated regimes vary things like volatility, trend/memory, order arrival
-rate, jumps, and liquidity. The demonstrations come from three expert families:
+The simulator creates market regimes with different volatility, drift, memory,
+jump behavior, liquidity, and order-arrival intensity. The visible regimes cover
+random, high-volatility, low-volatility, and trending cases. Hidden regimes add
+held-out combinations such as mean-reverting markets and stronger trending
+settings.
 
-- Avellaneda-Stoikov style expert (`AS`)
-- `GLFT`
-- `GLFT-drift`
+## Expert Demonstrations
 
-## Verifier
+The demonstrations come from three analytical expert families:
 
-The verifier is `src/pm_env/scoring_script.py`.
+- `AS`: an Avellaneda-Stoikov-style inventory-aware expert.
+- `GLFT`: a Guéant-Lehalle-Fernandez-Tapia-style quoting expert.
+- `GLFT-drift`: a GLFT-style expert with drift-aware quote skewing.
 
-It first checks that the submitted model has the right interface:
+These experts provide bid and ask offsets for visible training states. The
+learned policy is expected to absorb their behavior into one adaptive model:
+quote wider under volatility, react to buy/sell arrival pressure, skew quotes to
+manage inventory, and avoid collapsing to a static spread.
 
-- `FlowHFTPolicy` exists
-- the checkpoint loads
-- input shape is `(batch, 10)`
-- output shape is `(batch, 2)`
-- outputs are finite and positive
+## Calibration
 
-Then it rolls out the submitted policy on hidden market paths. During rollout it
-tracks PnL, Sharpe ratio, drawdown, inventory, and action variation.
+The task prompt recommends a lightweight affine calibration:
 
-The hidden scorer also rolls out the three expert baselines on the same hidden
-regimes:
+```text
+calibrated_action = alpha * raw_action + beta
+```
 
-- `AS`
-- `GLFT`
-- `GLFT-drift`
+`alpha` can be a scalar or per-action scale, and `beta` is a two-dimensional
+offset for bid and ask quotes. The calibration should be selected using only
+visible validation data. The goal is not just lower imitation MSE; the chosen
+calibration should improve rollout behavior, including PnL, Sharpe ratio,
+drawdown, inventory control, regime robustness, and action adaptivity.
 
-The final score compares the submitted policy against those experts at the
-regime level. It does not use a hindsight oracle that picks the best expert
-after each individual episode.
+## Scoring
 
-The approximate score weights are:
+The verifier in `src/pm_env/scoring_script.py` first checks the model artifact:
 
-- 30% normalized PnL vs the expert family
-- 20% Sharpe ratio vs the expert family
-- 15% drawdown control vs the expert family
-- 15% inventory control vs the expert family
+- `policy.py` exists.
+- `FlowHFTPolicy` exists and is a `torch.nn.Module`.
+- `flowhft_policy.pt` loads as a `state_dict`.
+- Forward pass accepts `(batch, 10)` and returns `(batch, 2)`.
+- Outputs are finite and positive.
+
+After validation, the verifier rolls out the policy on hidden market paths. It
+tracks:
+
+- PnL
+- Sharpe ratio
+- Maximum drawdown
+- Average and maximum inventory
+- Action variation
+- Robustness across regimes
+
+The hidden scorer also rolls out the `AS`, `GLFT`, and `GLFT-drift` expert
+baselines on the same hidden regimes. The final score compares the candidate
+policy against the expert family at the regime level.
+
+The approximate score components are:
+
+- 30% normalized PnL versus the expert family
+- 20% Sharpe ratio versus the expert family
+- 15% drawdown control versus the expert family
+- 15% inventory control versus the expert family
 - 10% robustness across regimes
 - 10% action adaptivity
 
-This means a policy can make a lot of money and still lose points if it does so
-by carrying too much inventory or failing one regime badly.
+This means the benchmark rewards balanced market-making behavior. A policy that
+earns high PnL by carrying excessive inventory or failing badly in one regime can
+still lose points.
 
-The verifier prints a short stdout summary before the full JSON result. This
-makes it easier to quickly read the final score, component scores, and key
-policy metrics from the run output.
+## Reward-Hacking Controls
+
+The environment includes explicit constraints to keep the task focused on the
+intended research problem. The agent is instructed not to:
+
+- Read, modify, copy, or infer hidden scoring data.
+- Modify the scorer, task files, setup files, package files, or run config.
+- Monkeypatch Python, PyTorch, NumPy, imports, file APIs, or subprocess behavior.
+- Hardcode validation rows, file paths, file hashes, regime IDs, or examples.
+- Special-case public validation files.
+- Use side channels such as clock time, process ID, current directory, or machine
+  details.
+- Download internet resources.
+- Save artifacts that only work in the training session.
+
+Hidden data is separated from visible data, and the verifier checks the model
+interface before rollout so invalid artifacts fail early.
 
 ## Running Locally
 
@@ -179,7 +276,7 @@ Install dependencies:
 uv sync
 ```
 
-Generate the data:
+Generate the visible and hidden data:
 
 ```bash
 uv run setup_data.py
@@ -197,53 +294,39 @@ Run the environment:
 uv run pm_env run --config run_config.json
 ```
 
-If using Docker instead of Podman, run:
+If using Docker instead of Podman:
 
 ```bash
 uv run pm_env run --config run_config.json --runtime docker
 ```
 
-On my laptop, a full run usually takes around 15 minutes. The transcript used
-for this submission is saved at `out/transcript.json`.
-
 ## Hardware
 
-No GPU or TPU is required. The environment is designed to run on CPU.
+No GPU or TPU is required. The benchmark is intentionally CPU-sized. The policy
+architecture should be compact, deterministic, and fast enough to call many
+times during hidden rollout.
 
-The agent is explicitly told not to assume CUDA is available. The intended model
-is small enough to train and evaluate locally in a few minutes inside the
-container.
+Recommended modeling choices include:
 
-## Notes And Limitations
+- Small MLP encoders for state, action, and time.
+- LayerNorm or residual MLP blocks if useful.
+- SiLU or ReLU activations.
+- A small fixed Euler integration count such as 4, 6, 8, or 10.
+- Registered buffers for normalization statistics and calibration constants.
 
-This is a compact environment, not a full reproduction of the FlowHFT paper.
-Some simplifications I made:
+The prompt discourages BatchNorm, Dropout, CUDA-only logic, random sampling in
+`forward`, and large architectures that would make rollout slow.
 
-- the action is a single bid/ask pair instead of a longer action sequence
-- the simulator is lightweight and synthetic
-- the expert strategies are simplified analytical versions
-- the verifier focuses on hidden rollout behavior rather than training a full
-  production trading system
+## Limitations
 
-I still tried to keep the core challenge intact: learn a single adaptive policy
-from expert demonstrations and evaluate it out-of-sample across different
-market regimes.
+This is a compact benchmark, not a full reproduction of the FlowHFT paper or a
+production trading system. Important simplifications include:
 
-One thing I iterated on quite a bit was the verifier. In earlier versions the
-score was too high, around `0.92`, and the task felt too easy. I changed the
-scoring to compare the submitted policy against AS, GLFT, and GLFT-drift across
-hidden regimes. The final successful runs landed closer to `0.66`, which felt
-like a better difficulty level: solvable, but not trivial.
+- The action is a single bid/ask pair rather than a longer action sequence.
+- The market simulator is synthetic and intentionally lightweight.
+- The expert policies are simplified analytical approximations.
+- The reward is an executable benchmark score, not a live trading objective.
 
-My understanding is that this kind of task/verifier setup could be useful for
-RLVR-style training, where a model is optimized against a concrete executable
-reward. In this case, methods like PPO or GRPO could train an agent to become
-better at building and calibrating the policy. This is my first time building an
-environment like this, so I may be missing details, but I would like to learn
-more and keep improving it.
-
-## AI Tool Usage
-
-I used AI assistance mainly for debugging and checking edge cases while I
-iterated on the environment. The transcript is included at `out/transcript.json`
-so the review team can see that process.
+The main purpose is to test whether an agent can build a portable, calibrated,
+FlowHFT-style policy that generalizes from visible expert demonstrations to
+hidden market-making rollouts.
