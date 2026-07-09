@@ -311,6 +311,18 @@ Key hidden rollout metrics for the GRPO-trained policy:
 - Mean max absolute inventory: `6.07`
 - Action standard deviation: `0.0145`
 
+### Result Figures
+
+![GRPO training progress](docs/figures/grpo_training_progress.png)
+
+![Hidden verifier score components](docs/figures/verifier_score_components.png)
+
+![Per-regime hidden verifier scores](docs/figures/per_regime_scores.png)
+
+![Policy versus expert baselines](docs/figures/policy_vs_experts.png)
+
+![Regime PnL and inventory risk](docs/figures/regime_pnl_inventory.png)
+
 The result graphs can be regenerated with `scripts/plot_grpo_results.py`.
 
 ## Reward-Hacking Controls
@@ -371,7 +383,8 @@ python scripts/plot_grpo_results.py --summary env_data/grpo_training_summary.jso
 
 The plotting script writes PNG charts for GRPO training progress, verifier score
 components, per-regime scores, policy-vs-expert comparisons, and regime-level
-PnL/inventory behavior.
+PnL/inventory behavior. To update the README-rendered figures on GitHub, copy
+the regenerated PNG files from `out/figures/` into `docs/figures/`.
 
 ## LLM GRPO / RLVR Workflow
 
