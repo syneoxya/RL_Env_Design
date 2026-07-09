@@ -250,6 +250,69 @@ This means the benchmark rewards balanced market-making behavior. A policy that
 earns high PnL by carrying excessive inventory or failing badly in one regime can
 still lose points.
 
+## GRPO Policy Optimization Results
+
+I initially considered running GRPO on the LLM agent itself, where the model
+would generate multiple candidate code solutions, each candidate would be
+executed and scored, and the LLM weights would be updated from verifier rewards.
+That is the full RLVR-style setup, but it requires a trainable open-weight LLM,
+substantial rollout infrastructure, and more compute than was practical for this
+local CPU-focused environment.
+
+Instead, this repository implements GRPO-style optimization directly on the
+FlowHFT market-making policy. The policy is first warm-started on expert
+demonstrations, then multiple sampled quote trajectories are rolled out for the
+same visible market path. Rewards are normalized within each group, and the
+policy is updated with a clipped group-relative objective.
+
+One local GRPO policy run used:
+
+- `40` GRPO update steps
+- `6` sampled trajectories per market-path group
+- `3` visible validation episodes per update step
+- `200` timesteps per episode
+- `18` full rollout trajectories per GRPO step
+- `720` total sampled rollout trajectories across training
+
+Visible rollout score improved during GRPO training:
+
+| Step | Visible Score |
+| --- | ---: |
+| 0 | 0.491 |
+| 10 | 0.525 |
+| 20 | 0.557 |
+| 30 | 0.585 |
+| 39 | 0.605 |
+
+The resulting policy was then evaluated with the hidden verifier. The local
+hidden score was:
+
+```text
+final_score: 0.749
+```
+
+Hidden verifier component scores:
+
+| Component | Score |
+| --- | ---: |
+| PnL | 0.790 |
+| Sharpe | 0.803 |
+| Drawdown control | 0.642 |
+| Inventory control | 0.645 |
+| Robustness | 0.895 |
+| Action adaptivity | 0.693 |
+
+Key hidden rollout metrics for the GRPO-trained policy:
+
+- Mean normalized PnL: `17.94`
+- Mean Sharpe ratio: `52.19`
+- Mean max drawdown: `0.129`
+- Mean average absolute inventory: `3.94`
+- Mean max absolute inventory: `6.07`
+- Action standard deviation: `0.0145`
+
+The result graphs can be regenerated with `scripts/plot_grpo_results.py`.
+
 ## Reward-Hacking Controls
 
 The environment includes explicit constraints to keep the task focused on the
@@ -281,6 +344,88 @@ Generate the visible and hidden data:
 ```bash
 uv run setup_data.py
 ```
+
+Train a local GRPO policy on the visible rollout paths:
+
+```bash
+uv run pm_env train-grpo-policy --grpo-steps 40 --group-size 6
+```
+
+This command writes a verifier-compatible `policy.py`, `flowhft_policy.pt`, and
+`grpo_training_summary.json` to `env_data/` by default. The trainer uses a small
+supervised expert warm start, then performs group-relative policy optimization
+over public validation episodes. Each GRPO group samples multiple quote
+trajectories for the same market path, normalizes rewards within the group, and
+updates the stochastic policy with a clipped policy-gradient objective.
+
+The visible GRPO reward is shaped to match the hidden verifier's market-making
+goals: normalized PnL, Sharpe ratio, drawdown control, inventory control,
+positive-regime behavior, and action adaptivity. Hidden scoring remains isolated
+and is not used during training.
+
+Create result graphs after training and verification:
+
+```bash
+python scripts/plot_grpo_results.py --summary env_data/grpo_training_summary.json --results out/grpo_results.json --output-dir out/figures
+```
+
+The plotting script writes PNG charts for GRPO training progress, verifier score
+components, per-regime scores, policy-vs-expert comparisons, and regime-level
+PnL/inventory behavior.
+
+## LLM GRPO / RLVR Workflow
+
+The `train-grpo-policy` command optimizes the market-making policy directly. For
+LLM GRPO, the trainable object is different: the model being optimized is the
+coding agent that writes `policy.py` and trains `flowhft_policy.pt`.
+
+I did not run LLM-weight GRPO in this repository because local training would
+require an open-weight coding model, GPU-class compute for repeated updates, and
+a larger rollout system for tool-using code-generation trajectories. The repo
+does include the rollout collection/export pieces needed for that setup, while
+the completed runnable experiment uses GRPO on the policy itself.
+
+This repository can collect the executable rollouts needed for that setup:
+
+```text
+same task prompt
+  -> sample N LLM solution attempts
+  -> run each attempt in the environment
+  -> score each attempt with the verifier
+  -> normalize rewards within the group
+  -> export GRPO records for an open-weight LLM trainer
+```
+
+Create grouped rollout configs:
+
+```bash
+uv run pm_env create-llm-grpo-rollouts --base-config run_config.json --output-dir out/llm_grpo --n-groups 1 --group-size 8
+```
+
+Generated rollout configs strip `model_api_key` by default, so set the key in
+your shell before running candidates:
+
+```bash
+export ANTHROPIC_API_KEY="..."
+```
+
+Run the generated rollout script:
+
+```bash
+bash out/llm_grpo/run_rollouts.sh
+```
+
+Export GRPO records:
+
+```bash
+uv run pm_env export-llm-grpo-records --rollout-dir out/llm_grpo --output out/llm_grpo/grpo_records.jsonl
+```
+
+The exported JSONL contains each candidate's prompt, transcript messages,
+assistant text, verifier reward, and group-relative advantage. Those records can
+feed an external LLM training stack such as TRL, verl, or OpenRLHF when using an
+open-weight model. API-hosted models can be used to collect candidate rollouts,
+but their weights cannot be updated locally.
 
 Create a run config:
 

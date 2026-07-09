@@ -252,6 +252,119 @@ def _run_without_ui(
         )
 
 
+@app.command()
+def train_grpo_policy(
+    env_dir: Annotated[
+        str | None,
+        typer.Option(help="Directory containing generated visible environment data."),
+    ] = None,
+    output_dir: Annotated[
+        str | None,
+        typer.Option(help="Directory where policy.py and flowhft_policy.pt are written."),
+    ] = None,
+    seed: Annotated[int, typer.Option(help="Random seed.")] = 7,
+    imitation_epochs: Annotated[
+        int,
+        typer.Option(help="Number of supervised expert warm-start epochs."),
+    ] = 8,
+    grpo_steps: Annotated[
+        int,
+        typer.Option(help="Number of GRPO policy updates."),
+    ] = 40,
+    group_size: Annotated[
+        int,
+        typer.Option(help="Number of sampled rollouts per prompt/episode group."),
+    ] = 6,
+    episodes_per_step: Annotated[
+        int,
+        typer.Option(help="Number of public validation episodes sampled per GRPO step."),
+    ] = 3,
+    eval_every: Annotated[
+        int,
+        typer.Option(help="Evaluate visible rollout score every N GRPO steps."),
+    ] = 5,
+) -> None:
+    """Train a verifier-compatible market-making policy with GRPO."""
+    from pm_env.grpo_trainer import build_arg_parser, train_grpo
+
+    args = build_arg_parser().parse_args([])
+    args.env_dir = env_dir
+    args.output_dir = output_dir
+    args.seed = seed
+    args.imitation_epochs = imitation_epochs
+    args.grpo_steps = grpo_steps
+    args.group_size = group_size
+    args.episodes_per_step = episodes_per_step
+    args.eval_every = eval_every
+
+    summary = train_grpo(args)
+    rich.print("[bold blue]Saved GRPO policy artifacts[/bold blue]")
+    rich.print(f"  policy.py: {summary['policy_path']}")
+    rich.print(f"  checkpoint: {summary['checkpoint_path']}")
+    rich.print(f"  visible_score: {summary['visible_score']:.6f}")
+
+
+@app.command()
+def create_llm_grpo_rollouts(
+    base_config: Annotated[
+        str,
+        typer.Option(help="Base EvaluationRunConfig JSON path."),
+    ] = "run_config.json",
+    output_dir: Annotated[
+        str,
+        typer.Option(help="Directory for grouped rollout configs and transcripts."),
+    ] = "out/llm_grpo",
+    n_groups: Annotated[
+        int,
+        typer.Option(help="Number of GRPO prompt groups to create."),
+    ] = 1,
+    group_size: Annotated[
+        int,
+        typer.Option(help="Number of LLM solution attempts per group."),
+    ] = 8,
+    keep_api_key: Annotated[
+        bool,
+        typer.Option(
+            help="Keep model_api_key in generated configs instead of using environment variables."
+        ),
+    ] = False,
+) -> None:
+    """Create grouped run configs for LLM-agent GRPO rollouts."""
+    from pm_env.llm_grpo_rollouts import make_rollout_configs
+    from pm_env.run_helpers import parse_config
+
+    config_paths = make_rollout_configs(
+        parse_config(base_config),
+        output_dir=Path(output_dir),
+        n_groups=n_groups,
+        group_size=group_size,
+        strip_api_key=not keep_api_key,
+    )
+    rich.print(f"[bold blue]Wrote {len(config_paths)} rollout configs[/bold blue]")
+    rich.print(f"  configs: {Path(output_dir) / 'configs'}")
+    rich.print(f"  run script: {Path(output_dir) / 'run_rollouts.sh'}")
+
+
+@app.command()
+def export_llm_grpo_records(
+    rollout_dir: Annotated[
+        str,
+        typer.Option(help="Directory containing completed LLM GRPO rollout transcripts."),
+    ] = "out/llm_grpo",
+    output: Annotated[
+        str,
+        typer.Option(help="JSONL output path for GRPO training records."),
+    ] = "out/llm_grpo/grpo_records.jsonl",
+) -> None:
+    """Export scored LLM-agent rollouts as GRPO JSONL training records."""
+    from pm_env.llm_grpo_rollouts import export_grpo_records
+
+    records = export_grpo_records(Path(rollout_dir), Path(output))
+    rich.print(f"[bold blue]Wrote {len(records)} GRPO records[/bold blue]")
+    rich.print(f"  records: {output}")
+    rich.print(f"  summary: {Path(output).with_suffix('.summary.json')}")
+
+
 def _print_and_abort(message: str) -> None:
     typer.secho(
         message,
