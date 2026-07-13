@@ -20,7 +20,107 @@ task definition
     -> transcript or grouped RL training records
 ```
 
-## 1. How the RL Environment Works
+## 1. Run the Full RL Environment
+
+The commands below launch the complete workflow in which an LLM inspects the
+visible data, writes and trains a market-making model, and receives a reward
+from the hidden verifier.
+
+### Prerequisites
+
+Install `uv` and start Docker Desktop:
+
+```bash
+brew install uv
+brew install --cask docker
+```
+
+Confirm that both are available:
+
+```bash
+uv --version
+docker info
+```
+
+### Install and check the project
+
+From the repository root:
+
+```bash
+uv sync
+uv run pm_env check
+uv run pm_env list-tasks
+```
+
+### Generate the data
+
+```bash
+uv run setup_data.py
+```
+
+This writes visible training and validation files to `env_data/` and private
+verifier files to `scoring_data/`.
+
+### Configure the LLM
+
+```bash
+export ANTHROPIC_API_KEY="..."
+
+uv run pm_env create-run-config \
+  --model claude-haiku-4-5-20251001 \
+  --model-api-key "$ANTHROPIC_API_KEY"
+```
+
+Do not commit `run_config.json` because it contains the API key.
+
+### Launch the LLM, tools, and verifier
+
+```bash
+uv run pm_env run \
+  --config run_config.json \
+  --runtime docker \
+  --keep-containers
+```
+
+During this command, the environment automatically:
+
+1. Sends the FlowHFT research prompt to the LLM.
+2. Gives the LLM controlled Bash access to the visible files in `/workdir`.
+3. Lets the LLM inspect data, write `policy.py`, and train
+   `flowhft_policy.pt`.
+4. Records the LLM's messages, commands, outputs, and token usage.
+5. Stops the agent loop when the LLM makes no more tool calls.
+6. Runs the root-owned verifier on hidden market regimes.
+7. Prints and records the final reward and component scores.
+
+The complete event history is saved to:
+
+```text
+out/transcript.json
+```
+
+Show the final verifier result:
+
+```bash
+jq '.events[] | select(.type == "scoring") | .scoring' out/transcript.json
+```
+
+The terminal prints a container name such as `pm_env_run_<run-id>`. Copy the
+LLM-generated model to the host with:
+
+```bash
+mkdir -p out/llm_workdir
+docker cp pm_env_run_<run-id>:/workdir/. out/llm_workdir/
+
+ls -lh \
+  out/llm_workdir/policy.py \
+  out/llm_workdir/flowhft_policy.pt
+```
+
+See [Detailed Run Reference](#detailed-run-reference) for Podman commands,
+live transcript monitoring, parallel attempts, cleanup, and troubleshooting.
+
+## 2. How the RL Environment Works
 
 ### The execution lifecycle
 
@@ -164,7 +264,7 @@ task.
 This makes the verifier the source of reward. The LLM's explanation, confidence,
 or claimed training metrics do not determine success.
 
-## 2. The Research Task: Adaptive Market Making
+## 3. The Research Task: Adaptive Market Making
 
 The research question is whether an AI agent can build a compact policy that
 combines expert market-making behavior and generalizes across unseen synthetic
@@ -307,7 +407,7 @@ the best expert retrospectively for every episode. A candidate can therefore
 lose points despite high average PnL if it carries excessive inventory, suffers
 large drawdowns, collapses to static quotes, or fails in one regime.
 
-## 3. GRPO and RLVR Workflows
+## 4. GRPO and RLVR Workflows
 
 There are two distinct objects that could be optimized with GRPO in this
 project. Keeping them separate is important.
@@ -393,7 +493,7 @@ uv run pm_env export-llm-grpo-records \
 The JSONL records include the task prompt, transcript messages, assistant text,
 verifier reward, and group-relative advantage.
 
-## Running the Full LLM Environment
+## Detailed Run Reference
 
 This workflow launches the complete environment. The LLM receives the task,
 uses Bash to inspect the visible data, writes and trains a candidate policy, and
