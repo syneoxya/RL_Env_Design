@@ -126,6 +126,84 @@ def validate_model_interface(
     if not (y > 0).all():
         fail("Model output must contain positive bid/ask offsets", output_path)
 
+    validate_flow_contract(model, output_path)
+
+
+def validate_flow_contract(
+    model: torch.nn.Module,
+    output_path: str | None = None,
+) -> None:
+    """Enforce the architectural requirements that are part of the task contract."""
+    buffers = dict(model.named_buffers())
+    required_buffers = {
+        "state_mean": (STATE_DIM,),
+        "state_std": (STATE_DIM,),
+        "action_mean": (ACTION_DIM,),
+        "action_std": (ACTION_DIM,),
+        "alpha": (ACTION_DIM,),
+        "beta": (ACTION_DIM,),
+    }
+    for name, shape in required_buffers.items():
+        if name not in buffers:
+            fail(f"FlowHFTPolicy must register the {name} buffer", output_path)
+        value = buffers[name]
+        if tuple(value.shape) != shape:
+            fail(
+                f"Buffer {name} must have shape {shape}, got {tuple(value.shape)}",
+                output_path,
+            )
+        if not torch.isfinite(value).all():
+            fail(f"Buffer {name} contains NaN or Inf", output_path)
+    if not (buffers["state_std"] > 0).all() or not (
+        buffers["action_std"] > 0
+    ).all():
+        fail("Normalization standard-deviation buffers must be positive", output_path)
+
+    if not hasattr(model, "vector_field") or not isinstance(
+        model.vector_field, torch.nn.Module
+    ):
+        fail("FlowHFTPolicy must define vector_field as a torch.nn.Module", output_path)
+    if not callable(getattr(model, "velocity", None)):
+        fail(
+            "FlowHFTPolicy must define velocity(action_t, time, normalized_state)",
+            output_path,
+        )
+    if not callable(getattr(model, "raw_action", None)):
+        fail("FlowHFTPolicy must define raw_action(state)", output_path)
+
+    calls = []
+    hook = model.vector_field.register_forward_hook(lambda *args: calls.append(True))
+    try:
+        with torch.no_grad():
+            x = torch.randn(4, STATE_DIM)
+            normalized_state = (x - buffers["state_mean"]) / buffers[
+                "state_std"
+            ].clamp_min(1e-6)
+            action_t = torch.randn(4, ACTION_DIM)
+            time = torch.rand(4, 1)
+            velocity = model.velocity(action_t, time, normalized_state)
+            calls.clear()
+            raw = model.raw_action(x)
+            output = model(x)
+    except Exception as e:
+        fail(f"Conditional flow contract check failed: {repr(e)}", output_path)
+    finally:
+        hook.remove()
+
+    if tuple(velocity.shape) != (4, ACTION_DIM) or not torch.isfinite(velocity).all():
+        fail("velocity must return finite values with shape (batch, 2)", output_path)
+    if tuple(raw.shape) != (4, ACTION_DIM) or not torch.isfinite(raw).all():
+        fail("raw_action must return finite values with shape (batch, 2)", output_path)
+    if not calls:
+        fail("forward/raw_action must integrate and call the learned vector_field", output_path)
+
+    expected = buffers["alpha"] * raw + buffers["beta"]
+    expected = torch.nan_to_num(
+        expected, nan=0.002, posinf=0.250, neginf=0.002
+    ).clamp(0.002, 0.250)
+    if not torch.allclose(output, expected, atol=1e-6, rtol=1e-5):
+        fail("forward must apply alpha * raw_action + beta before safe clamping", output_path)
+
 
 def make_state(
     prices: np.ndarray,

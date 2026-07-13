@@ -247,7 +247,11 @@ The prompt explicitly prohibits:
 Before scoring behavior, the verifier checks that the required files exist,
 that the submitted class is a `torch.nn.Module`, that the checkpoint is a real
 `state_dict`, and that inference has the required shape and finite positive
-outputs. Invalid, nonportable, or non-executable artifacts fail early.
+outputs. It also validates registered state/action normalization and affine
+calibration buffers, exercises the conditional velocity interface, confirms
+that inference calls the submitted `vector_field`, and checks that `forward`
+applies `alpha * raw_action + beta` before safe clamping. Invalid, nonportable,
+non-flow, or non-executable artifacts fail early.
 
 No defense is perfect. The design goal is defense in depth: prompt constraints,
 OS permissions, user separation, network restrictions, interface validation,
