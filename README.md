@@ -395,36 +395,255 @@ verifier reward, and group-relative advantage.
 
 ## Running the Full LLM Environment
 
-Install dependencies and generate data:
+This workflow launches the complete environment. The LLM receives the task,
+uses Bash to inspect the visible data, writes and trains a candidate policy, and
+then submits that policy to the hidden verifier. It is different from
+`train-grpo-policy`, which trains a built-in policy directly without an LLM.
+
+### 1. Install the prerequisites
+
+The full run requires:
+
+- Python 3.12
+- `uv`
+- Docker or Podman
+- An API key for the configured LLM provider
+
+On macOS, one installation path is:
+
+```bash
+brew install uv
+brew install --cask docker
+```
+
+Start Docker Desktop before continuing. Confirm that the required commands are
+available:
+
+```bash
+uv --version
+docker --version
+docker info
+```
+
+If using Podman instead:
+
+```bash
+brew install podman
+podman machine init
+podman machine start
+podman info
+```
+
+### 2. Install the project
+
+From the repository root:
 
 ```bash
 uv sync
+uv run pm_env check
+uv run pm_env list-tasks
+```
+
+The check command confirms that the task and MCP tools are registered. The
+container build performs an additional permission test to confirm that the
+model user cannot access hidden scoring files.
+
+### 3. Generate visible and hidden data
+
+```bash
 uv run setup_data.py
 ```
 
-Create a run configuration:
+This creates two separate data areas:
+
+```text
+env_data/       visible training and validation files copied to the LLM
+scoring_data/   hidden paths copied into the root-only verifier directory
+```
+
+The LLM sees the contents of `env_data/` in `/workdir`. It does not receive
+`scoring_data/`.
+
+### 4. Configure the LLM
+
+Set the provider key in the current shell. For the default Anthropic model:
 
 ```bash
 export ANTHROPIC_API_KEY="..."
+```
+
+Create `run_config.json`:
+
+```bash
 uv run pm_env create-run-config \
   --model claude-haiku-4-5-20251001 \
   --model-api-key "$ANTHROPIC_API_KEY"
 ```
 
-Launch the LLM agent, tool loop, and hidden verifier with Podman:
+Inspect the non-secret fields:
 
 ```bash
-uv run pm_env run --config run_config.json
+python -c 'import json; d=json.load(open("run_config.json")); d["model_api_key"]="***"; print(json.dumps(d, indent=2))'
 ```
 
-Or with Docker:
+`run_config.json` contains the API key when it is passed on the command line. Do
+not commit this file. The config also selects the task, model, MCP server, event
+stream, and transcript output path.
+
+### 5. Launch the complete agent run
+
+With Docker:
 
 ```bash
-uv run pm_env run --config run_config.json --runtime docker
+uv run pm_env run \
+  --config run_config.json \
+  --runtime docker \
+  --keep-containers
 ```
 
-The terminal streams the agent and scoring events. The complete structured run
-is saved to `out/transcript.json`.
+With Podman:
+
+```bash
+uv run pm_env run \
+  --config run_config.json \
+  --runtime podman \
+  --keep-containers
+```
+
+`--keep-containers` is recommended when inspecting a run because the model's
+generated files remain inside the container after verification. Without this
+flag, the temporary container is removed automatically, but the transcript is
+still saved on the host.
+
+The first run builds the environment image and can take longer than subsequent
+runs. The terminal prints a container name in this form:
+
+```text
+pm_env_run_<run-id>
+```
+
+### 6. What the LLM does during the run
+
+Inside the container, the following happens automatically:
+
+1. The environment sends the full FlowHFT task prompt to the LLM.
+2. The LLM examines visible arrays, metadata, and validation paths with its Bash
+   tool.
+3. The LLM writes `/workdir/policy.py` containing `FlowHFTPolicy`.
+4. The LLM writes a training script or executes inline Python to learn from the
+   expert demonstrations.
+5. Training produces `/workdir/flowhft_policy.pt`.
+6. The LLM checks tensor shapes, finite positive actions, checkpoint loading,
+   imitation metrics, and any visible rollout metrics it chooses to compute.
+7. When the LLM stops calling tools, the evaluation runner invokes the
+   executable judge.
+8. The root-owned verifier loads the two artifacts and rolls the policy out on
+   hidden regimes.
+9. The verifier compares the candidate with AS, GLFT, and GLFT-drift baselines,
+   computes the weighted score, and emits a `scoring` event.
+
+The model does not manually call the hidden verifier. Transitioning from the
+agent loop to scoring is controlled by `evaluation_runner.py`.
+
+### 7. Watch the agent and verifier
+
+The main terminal streams model messages, tool calls, token usage, errors, and
+the final score. The same events are written to `out/transcript.json`.
+
+In a second terminal, show the latest event every two seconds:
+
+```bash
+while true; do
+  jq -r '.events[-1] | [.timestamp, .type] | @tsv' out/transcript.json
+  sleep 2
+done
+```
+
+After the run, list the LLM's tool calls:
+
+```bash
+jq '.events[] | select(
+  .type == "tool_call_started" or
+  .type == "tool_call_completed"
+)' out/transcript.json
+```
+
+Show only verifier results:
+
+```bash
+jq '.events[] | select(.type == "scoring") | .scoring' out/transcript.json
+```
+
+Confirm that the task completed:
+
+```bash
+jq '.events[] | select(.type == "task_completed")' out/transcript.json
+```
+
+### 8. Copy the LLM-generated model out of the container
+
+Replace `<run-id>` with the identifier printed when the run starts.
+
+For Docker:
+
+```bash
+mkdir -p out/llm_workdir
+docker cp pm_env_run_<run-id>:/workdir/. out/llm_workdir/
+```
+
+For Podman:
+
+```bash
+mkdir -p out/llm_workdir
+podman cp pm_env_run_<run-id>:/workdir/. out/llm_workdir/
+```
+
+Inspect the required model artifacts:
+
+```bash
+ls -lh \
+  out/llm_workdir/policy.py \
+  out/llm_workdir/flowhft_policy.pt
+```
+
+The work directory may also contain training scripts, logs, calibration results,
+and other files the LLM created while solving the task.
+
+Remove the preserved container when finished:
+
+```bash
+docker rm pm_env_run_<run-id>
+```
+
+Use `podman rm` for a Podman run.
+
+### 9. Run multiple independent LLM attempts
+
+Containerized execution supports parallel attempts:
+
+```bash
+uv run pm_env run \
+  --config run_config.json \
+  --runtime docker \
+  --n-parallel 4
+```
+
+Each attempt receives its own run ID and transcript filename. Parallel attempts
+consume separate model API calls and may incur significant cost.
+
+### 10. Common failures
+
+- `uv: command not found`: install `uv` and restart the shell.
+- Docker daemon errors: start Docker Desktop and verify `docker info` succeeds.
+- Authentication errors: export the correct provider API key and recreate the
+  run config.
+- Missing arrays: run `uv run setup_data.py` before building the container.
+- Missing policy artifacts: preserve the container and inspect the transcript
+  for failed training commands or model errors.
+- No scoring event: inspect the transcript for an `error` event and confirm that
+  the task reached `task_completed`.
+- Permission-check failure: rebuild without `--dev` and confirm the container
+  filesystem was created by the current `Containerfile`.
 
 ## Repository Layout
 
