@@ -21,7 +21,7 @@ closely it imitates demonstrations.
 
 ## What This Project Does
 
-This project builds a full executable preference-model environment for a
+This project builds a full executable RL environment for a
 FlowHFT-inspired high-frequency market-making task. It includes:
 
 - Synthetic market data generation for visible and hidden regimes.
