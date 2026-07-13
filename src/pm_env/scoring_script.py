@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,9 @@ import torch
 STATE_DIM = 10
 ACTION_DIM = 2
 MAX_INVENTORY = 20.0
+MAX_PARAMETER_COUNT = 2_000_000
+MAX_BATCH32_LATENCY_SECONDS = 5.0
+MIN_DEPENDENCE_DELTA = 1e-6
 
 # Hidden rollout settings.
 FILL_DECAY = 12.0
@@ -96,6 +100,11 @@ def validate_model_interface(
 ) -> None:
     param_count = sum(p.numel() for p in model.parameters())
     print(f"parameter_count: {param_count}")
+    if param_count > MAX_PARAMETER_COUNT:
+        fail(
+            f"Model has {param_count} parameters; limit is {MAX_PARAMETER_COUNT}",
+            output_path,
+        )
 
     try:
         model.load_state_dict(state)
@@ -104,27 +113,52 @@ def validate_model_interface(
 
     model.eval()
 
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if tensor.device.type != "cpu":
+            fail("All model parameters and buffers must be on CPU", output_path)
+
     try:
         with torch.no_grad():
-            x = torch.randn(4, STATE_DIM)
-            y = model(x)
+            for batch_size in (1, 4, 32):
+                x = torch.randn(batch_size, STATE_DIM)
+                y = model(x)
+                if not isinstance(y, torch.Tensor):
+                    fail("Model output is not a torch.Tensor", output_path)
+                if tuple(y.shape) != (batch_size, ACTION_DIM):
+                    fail(
+                        f"Wrong output shape for batch {batch_size}: {tuple(y.shape)}",
+                        output_path,
+                    )
+                if not torch.isfinite(y).all() or not (y > 0).all():
+                    fail("Model outputs must be finite and positive", output_path)
+
+            x = torch.randn(16, STATE_DIM)
+            first = model(x)
+            second = model(x)
+            if not torch.equal(first, second):
+                fail("Inference must be deterministic for identical inputs", output_path)
+
+            started = time.perf_counter()
+            model(torch.randn(32, STATE_DIM))
+            latency = time.perf_counter() - started
+            if latency > MAX_BATCH32_LATENCY_SECONDS:
+                fail(
+                    f"Batch-32 CPU inference took {latency:.3f}s; limit is "
+                    f"{MAX_BATCH32_LATENCY_SECONDS:.1f}s",
+                    output_path,
+                )
+
+            for scale in (1.0, 10.0, 100.0):
+                robust = model(scale * torch.randn(4, STATE_DIM))
+                if not torch.isfinite(robust).all() or not (robust > 0).all():
+                    fail(
+                        f"Model is numerically unstable at input scale {scale:g}",
+                        output_path,
+                    )
+    except SystemExit:
+        raise
     except Exception as e:
         fail(f"Model forward pass failed: {repr(e)}", output_path)
-
-    if not isinstance(y, torch.Tensor):
-        fail("Model output is not a torch.Tensor", output_path)
-
-    if tuple(y.shape) != (4, ACTION_DIM):
-        fail(
-            f"Wrong output shape: expected (4, {ACTION_DIM}), got {tuple(y.shape)}",
-            output_path,
-        )
-
-    if not torch.isfinite(y).all():
-        fail("Model output contains NaN or Inf", output_path)
-
-    if not (y > 0).all():
-        fail("Model output must contain positive bid/ask offsets", output_path)
 
     validate_flow_contract(model, output_path)
 
@@ -182,8 +216,14 @@ def validate_flow_contract(
             action_t = torch.randn(4, ACTION_DIM)
             time = torch.rand(4, 1)
             velocity = model.velocity(action_t, time, normalized_state)
+            velocity_action = model.velocity(action_t + 0.5, time, normalized_state)
+            velocity_time = model.velocity(action_t, time + 0.5, normalized_state)
+            changed_state = normalized_state.clone()
+            changed_state[:, 0] += 0.5
+            velocity_state = model.velocity(action_t, time, changed_state)
             calls.clear()
             raw = model.raw_action(x)
+            raw_call_count = len(calls)
             output = model(x)
     except Exception as e:
         fail(f"Conditional flow contract check failed: {repr(e)}", output_path)
@@ -194,8 +234,18 @@ def validate_flow_contract(
         fail("velocity must return finite values with shape (batch, 2)", output_path)
     if tuple(raw.shape) != (4, ACTION_DIM) or not torch.isfinite(raw).all():
         fail("raw_action must return finite values with shape (batch, 2)", output_path)
-    if not calls:
-        fail("forward/raw_action must integrate and call the learned vector_field", output_path)
+    if raw_call_count < 2:
+        fail("raw_action must integrate vector_field for at least two steps", output_path)
+
+    dependence_checks = {
+        "current action": velocity_action,
+        "time": velocity_time,
+        "market state": velocity_state,
+    }
+    for name, changed_velocity in dependence_checks.items():
+        delta = torch.mean(torch.abs(changed_velocity - velocity)).item()
+        if delta <= MIN_DEPENDENCE_DELTA:
+            fail(f"velocity must depend on {name}", output_path)
 
     expected = buffers["alpha"] * raw + buffers["beta"]
     expected = torch.nan_to_num(
@@ -203,6 +253,85 @@ def validate_flow_contract(
     ).clamp(0.002, 0.250)
     if not torch.allclose(output, expected, atol=1e-6, rtol=1e-5):
         fail("forward must apply alpha * raw_action + beta before safe clamping", output_path)
+
+    validate_buffer_usage(model, buffers, output_path)
+    validate_market_behavior(model, buffers, output_path)
+
+
+def validate_buffer_usage(
+    model: torch.nn.Module,
+    buffers: dict[str, torch.Tensor],
+    output_path: str | None = None,
+) -> None:
+    """Reject registered-but-unused normalization or calibration buffers."""
+    x = buffers["state_mean"].unsqueeze(0) + 0.25 * buffers["state_std"].unsqueeze(0)
+    originals = {name: value.clone() for name, value in buffers.items()}
+    try:
+        with torch.no_grad():
+            baseline_raw = model.raw_action(x)
+            checks = {}
+
+            buffers["state_mean"].add_(0.1 * originals["state_std"])
+            checks["state_mean"] = model.raw_action(x)
+            buffers["state_mean"].copy_(originals["state_mean"])
+
+            buffers["state_std"].mul_(1.1)
+            checks["state_std"] = model.raw_action(x)
+            buffers["state_std"].copy_(originals["state_std"])
+
+            buffers["action_mean"].add_(0.01)
+            checks["action_mean"] = model.raw_action(x)
+            buffers["action_mean"].copy_(originals["action_mean"])
+
+            buffers["action_std"].mul_(1.1)
+            checks["action_std"] = model.raw_action(x)
+            buffers["action_std"].copy_(originals["action_std"])
+
+            baseline_output = model(x)
+            buffers["beta"].add_(0.005)
+            checks["beta"] = model(x)
+            buffers["beta"].copy_(originals["beta"])
+
+            buffers["alpha"].mul_(0.9)
+            checks["alpha"] = model(x)
+    except Exception as e:
+        fail(f"Buffer-usage check failed: {repr(e)}", output_path)
+    finally:
+        for name, original in originals.items():
+            buffers[name].copy_(original)
+
+    for name in ("state_mean", "state_std", "action_mean", "action_std"):
+        if torch.allclose(checks[name], baseline_raw, atol=1e-7, rtol=1e-6):
+            fail(f"raw_action does not use the {name} buffer", output_path)
+    for name in ("alpha", "beta"):
+        if torch.allclose(checks[name], baseline_output, atol=1e-7, rtol=1e-6):
+            fail(f"forward does not respond to the {name} calibration buffer", output_path)
+
+
+def validate_market_behavior(
+    model: torch.nn.Module,
+    buffers: dict[str, torch.Tensor],
+    output_path: str | None = None,
+) -> None:
+    """Check basic controlled-state behavior without replacing rollout scoring."""
+    base = buffers["state_mean"].clone()
+    cases = []
+    for feature, value in ((0, 0.5), (0, -0.5), (4, 0.005), (4, 0.04), (7, 0.3), (7, -0.3)):
+        state = base.clone()
+        state[feature] = value
+        cases.append(state)
+    with torch.no_grad():
+        actions = model(torch.stack(cases))
+
+    positive_inventory, negative_inventory, low_vol, high_vol, pos_flow, neg_flow = actions
+    if not positive_inventory[0] > positive_inventory[1]:
+        fail("Positive inventory should widen the bid relative to the ask", output_path)
+    if not negative_inventory[1] > negative_inventory[0]:
+        fail("Negative inventory should widen the ask relative to the bid", output_path)
+    if not high_vol.sum() > low_vol.sum():
+        fail("Higher realized volatility should widen total quote offsets", output_path)
+    if torch.allclose(pos_flow, neg_flow, atol=1e-5, rtol=1e-4):
+        fail("Policy must respond to order-flow imbalance", output_path)
 
 
 def make_state(

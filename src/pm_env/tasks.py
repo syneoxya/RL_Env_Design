@@ -90,6 +90,14 @@ def get_tasks(config: EvaluationRunConfig) -> list[Task]:
                         Do not replace the flow with a direct state-to-action MLP. Avoid BatchNorm,
                         Dropout, CUDA, random sampling during inference, or inference-time file I/O.
 
+                        The verifier also checks batch sizes 1/4/32, repeat-call determinism,
+                        numerical stability on large finite inputs, CPU placement, a 2M parameter
+                        limit, and a generous batch-32 latency limit. It confirms that velocity
+                        depends on action, time, and state; raw_action calls vector_field at least
+                        twice; and all six buffers affect the appropriate computation. Controlled
+                        states must widen quotes with volatility, skew against positive/negative
+                        inventory, and respond to order-flow imbalance.
+
                         ## Affine calibration
 
                         Select alpha and beta using only visible validation data. Prefer a small

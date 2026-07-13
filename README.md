@@ -253,6 +253,13 @@ that inference calls the submitted `vector_field`, and checks that `forward`
 applies `alpha * raw_action + beta` before safe clamping. Invalid, nonportable,
 non-flow, or non-executable artifacts fail early.
 
+The contract checks also cover deterministic repeated inference, batch sizes 1,
+4, and 32, CPU placement, parameter count, generous CPU latency, numerical
+stability, multiple Euler calls, vector-field dependence on action/time/state,
+actual use of every required buffer, and basic inventory/volatility/order-flow
+responses on controlled states. Hidden rollouts remain the authority for policy
+quality rather than these preflight checks.
+
 No defense is perfect. The design goal is defense in depth: prompt constraints,
 OS permissions, user separation, network restrictions, interface validation,
 hidden evaluation, and a complete audit transcript.
